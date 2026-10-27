@@ -1670,6 +1670,20 @@ struct MLXServer: AsyncParsableCommand {
                 lines.append("# HELP swiftlm_ssd_chunk_latency_ms Average per-chunk SSD read latency (ms, lifetime)")
                 lines.append("# TYPE swiftlm_ssd_chunk_latency_ms gauge")
                 lines.append("swiftlm_ssd_chunk_latency_ms \(String(format: "%.4f", ssd.avgChunkLatencyMS))")
+
+                // StreamEngine counters (the stacked expert path).
+                let engine = StreamEngine.shared.snapshot()
+                for (name, type, help, value) in [
+                    ("swiftlm_stream_expert_hits_total", "counter", "Routed experts already resident in a slot", "\(engine.hits)"),
+                    ("swiftlm_stream_expert_misses_total", "counter", "Routed experts read after routing", "\(engine.misses)"),
+                    ("swiftlm_stream_prefetched_experts_total", "counter", "Experts read ahead of routing", "\(engine.prefetchedUnits)"),
+                    ("swiftlm_stream_bytes_read_total", "counter", "Bytes read by the stream engine", "\(engine.bytesRead)"),
+                    ("swiftlm_stream_read_seconds_total", "counter", "Wall time spent in stream engine reads", String(format: "%.3f", Double(engine.readNanos) / 1e9)),
+                ] {
+                    lines.append("# HELP \(name) \(help)")
+                    lines.append("# TYPE \(name) \(type)")
+                    lines.append("\(name) \(value)")
+                }
             }
 
             lines.append("")
