@@ -19,6 +19,8 @@ MAX_TOKENS="${MAX_TOKENS:-256}"
 PORT="${PORT:-5413}"
 CONFIGS="${CONFIGS:-resident stream stream_stacked stream_topk4}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# Build first: a stale binary silently benchmarks old code.
+(cd "$ROOT" && swift build -c release --product SwiftLM) >&2
 BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/SwiftLM"
 mkdir -p "$OUT"
 

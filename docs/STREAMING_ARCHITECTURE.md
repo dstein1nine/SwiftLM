@@ -127,6 +127,12 @@ projection (two if gate and up are fused). On misses it runs
 `Stream.gpu.synchronize()` and a per-miss `print` to stdout. This is the
 nearest thing to a managed cache in the codebase, and it is off by default.
 
+*Since Phase 1:* this path runs on `StreamEngine`, is the default whenever
+`--stream-experts` is on (`MLX_MOE_STACKED=0` restores the per-expert path
+above), has no per-miss `print`, and syncs only with `MLX_MOE_MISS_SYNC=1`.
+Its prediction step turned out never to read anything: the previous token's
+experts are always still resident. See `CHANGELOG_STREAMING.md`.
+
 ### Prefill path (`idx.size > 32`)
 
 `MLX.eval(idx)`, then fresh buffers for the experts in use, then one
@@ -178,7 +184,7 @@ verified. Read from the code, not run.)*
 | `--ssd-prefetch` | CLI | Starts the PAPPS pool. **No effect** (no submitter). |
 | `SWIFTLM_TOP_K` | env | Top-k override, **Qwen35 sparse-MoE block only**. Clamped to ≤ config k. |
 | `MLX_MOE_CACHE_SLOTS` | env | Slot count for the stacked path only. |
-| `MLX_MOE_STACKED`, `MLX_MOE_FUSE_GATEUP` | env | Turn on the stacked LRU path and the fused gate+up path. |
+| `MLX_MOE_STACKED`, `MLX_MOE_FUSE_GATEUP` | env | Turn on the stacked LRU path and the fused gate+up path. Since Phase 1 stacked is the default; `MLX_MOE_STACKED=0` turns it off. |
 | `MLX_MOE_DECODE_FLUSH` | env | Qwen35: per-layer eval+sync on decode too. |
 | `--turbo-kv`, per-request `kv_bits` | CLI/API | Independent of streaming. `--turbo-kv` does nothing with `--ctx-size` (RotatingKVCache). |
 | `--gpu-layers` | CLI | CPU/GPU layer split. Bypassed when streaming. The only existing "dense > RAM" story. |

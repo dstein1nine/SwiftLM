@@ -1,6 +1,6 @@
 # Streaming changelog
 
-## Phase 1 — stream engine (in progress, 2026-10-27)
+## Phase 1 — stream engine (2026-10-27)
 
 - mlx-swift (add-only): `mlx_fast_pread_range_into` / `MLXFast.preadRangeInto`,
   a plain range read into an evaluated array with an optional `F_NOCACHE`
@@ -28,9 +28,32 @@
 - Finding: the stacked path's previous-token prefetch never reads anything in
   steady state, because the previous token's experts are always still
   resident. All its reads are misses.
-- Pending: benchmarks of the last two changes on a quiet machine (the first
-  run was skewed by 186 GB of LM Studio models in memory), and making stacked
-  the default.
+- Benchmark (quiet machine, warm page cache, 3 runs × 3 prompts × 256 tokens,
+  `.build/bench/phase1-final`, `CONFIGS="stream stream_stacked
+  stream_stacked_sync" scripts/profiling/phase0_baseline.sh`):
+
+  | config | decode tok/s (median [min–max]) | RSS peak | expert hit rate |
+  |---|---|---|---|
+  | `stream` (legacy path, unchanged, control) | 18.26 [18.21–18.44] | 4.3 GB | – |
+  | `stream_stacked` | 25.65 [25.17–26.58] | 4.8 GB | 51% |
+  | `stream_stacked_sync` (`MLX_MOE_MISS_SYNC=1`) | 24.27 [24.21–25.20] | 4.8 GB | 51% |
+
+  All three produce byte-identical output to Phase 0 on all prompts. The
+  control ran 14% faster than in Phase 0 (16.06), so Phase 0 was itself
+  partly skewed by other load; compare within a run. Stacked is now 40%
+  faster than the legacy path (24% in Phase 0); the per-miss sync costs 5%,
+  so it stays off.
+- The stacked path is now the default whenever `--stream-experts` is on.
+  `MLX_MOE_STACKED=0` restores the legacy per-expert path. No CLI flag
+  changed. Rerun (`.build/bench/phase1-default`, `CONFIGS="stream
+  stream_legacy"`): `stream` 25.62 [25.26–26.22] tok/s, 4.8 GB RSS;
+  `stream_legacy` 18.12 [18.05–18.38], 4.3 GB. Both byte-identical to
+  Phase 0.
+- `phase0_baseline.sh` now runs `swift build -c release` first. Before, it
+  benchmarked whatever binary was already built, which hid the default
+  change on the first rerun.
+- Tests: mlx-swift-lm `MLXLMTests` 884 executed, 0 failures (8 skipped,
+  serial mode); SwiftLM `make test` 326 executed, 0 failures.
 
 ## Phase 0 — survey and baseline (2026-10-27)
 
