@@ -1,6 +1,8 @@
 [submodule "mlx-swift"]
 	path = mlx-swift
-	url = https://github.com/SharpAI/mlx-swift.git
+	url = https://github.com/dstein1nine/mlx-swift.git
+	branch = moe-stream-engine
 [submodule "mlx-swift-lm"]
 	path = mlx-swift-lm
-	url = https://github.com/SharpAI/mlx-swift-lm.git
+	url = https://github.com/dstein1nine/mlx-swift-lm.git
+	branch = moe-stream-engine
