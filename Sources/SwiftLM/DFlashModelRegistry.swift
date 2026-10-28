@@ -24,7 +24,11 @@ func registerDFlashModelTypes() async {
         return DeepseekV3DFlashModel(config)
     }
 
-    // kimi_k25 uses the DeepSeek V3 architecture (different model_type string only).
+    // kimi_k2 / kimi_k25 use the DeepSeek V3 architecture (different model_type string only).
+    await registry.registerModelType("kimi_k2") { data in
+        let config = try JSONDecoder.json5().decode(DSV3Config.self, from: data)
+        return DeepseekV3DFlashModel(config)
+    }
     await registry.registerModelType("kimi_k25") { data in
         let config = try JSONDecoder.json5().decode(DSV3Config.self, from: data)
         return DeepseekV3DFlashModel(config)
