@@ -43,7 +43,8 @@ private struct HubDownloader: Downloader, Sendable {
     }
 }
 
-private struct TransformersTokenizerLoader: TokenizerLoader, Sendable {
+/// Internal (not private) so SwiftLMTests can load real tokenizer folders through it.
+struct TransformersTokenizerLoader: TokenizerLoader, Sendable {
     /// Carried purely so template diagnostics can name the offending checkpoint; the
     /// on-disk directory is a snapshot hash and means nothing to the person reading it.
     let modelId: String
