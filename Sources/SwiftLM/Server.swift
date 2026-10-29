@@ -2628,7 +2628,12 @@ func handleChatCompletion(
 
     // The Jinja template evaluates `not enable_thinking | default(false)`. If we pass nil instead of
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
-    let templateContext: [String: any Sendable] = ["enable_thinking": enableThinking]
+    // Kimi K2.x templates key on `thinking` instead (`thinking is defined and thinking is false`
+    // emits an empty <think></think> block); pass both names so either family sees the switch.
+    let templateContext: [String: any Sendable] = [
+        "enable_thinking": enableThinking,
+        "thinking": enableThinking,
+    ]
     let userInput = UserInput(chat: chatMessages, tools: toolSpecs, additionalContext: templateContext)
     print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audios.count) audio inputs.")
     let lmInput = try await container.prepare(input: userInput)
