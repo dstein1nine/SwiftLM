@@ -624,6 +624,9 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Hard cap on reasoning tokens per request (overridable per request with thinking_budget). After N thinking tokens the server closes the thinking block and the model answers. 0 closes it immediately. Needs thinking enabled and --max-tokens (or the request's max_tokens) large enough to hold the budget plus the answer. Default: no cap")
     var thinkingBudget: Int?
 
+    @Option(name: .long, help: "Default reasoning effort passed to the chat template as `reasoning_effort` (e.g. low, medium, high for GLM-5.x, whose template has no thinking off-switch). Overridable per request with reasoning_effort. Default: not passed")
+    var reasoningEffort: String?
+
     @Flag(name: .long, help: "Do not echo generated tokens to stdout as they stream. Request log lines are unaffected.")
     var noTokenEcho: Bool = false
 
@@ -1453,6 +1456,7 @@ struct MLXServer: AsyncParsableCommand {
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
             thinkingBudget: self.thinkingBudget,
+            reasoningEffort: self.reasoningEffort,
             maxPromptTokens: self.maxPromptTokens,
             promptCacheEntries: self.promptCacheEntries,
             tokenEcho: !self.noTokenEcho,
@@ -1490,10 +1494,11 @@ struct MLXServer: AsyncParsableCommand {
         let memLimitStr = self.memLimit.map { "\($0)MB" } ?? "system_default"
         let authStr = apiKeyValue != nil ? "enabled" : "disabled"
         let thinkingStr = config.thinking ? "enabled" : "disabled"
+        let reasoningEffortStr = config.reasoningEffort ?? "unset"
         let ssdStr = self.streamExperts ? "enabled" : "disabled"
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), reasoning_effort=\(reasoningEffortStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
         if config.turboKV, let ctx = config.ctxSize {
             print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
         }
@@ -1786,6 +1791,8 @@ struct ServerConfig: Sendable {
     let thinking: Bool
     /// `--thinking-budget`: default cap on reasoning tokens. nil = no cap.
     let thinkingBudget: Int?
+    /// `--reasoning-effort`: default `reasoning_effort` template variable. nil = not passed.
+    let reasoningEffort: String?
     /// `--max-prompt-tokens`: longer prompts are rejected before prefill. nil = no limit.
     let maxPromptTokens: Int?
     /// `--prompt-cache-entries`: LRU capacity of the prompt cache.
@@ -2630,10 +2637,15 @@ func handleChatCompletion(
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
     // Kimi K2.x templates key on `thinking` instead (`thinking is defined and thinking is false`
     // emits an empty <think></think> block); pass both names so either family sees the switch.
-    let templateContext: [String: any Sendable] = [
+    var templateContext: [String: any Sendable] = [
         "enable_thinking": enableThinking,
         "thinking": enableThinking,
     ]
+    // GLM-5.x templates have no thinking off-switch; they read `reasoning_effort`
+    // (low/high, anything else → max). Request field wins over --reasoning-effort.
+    if let effort = chatReq.reasoningEffort ?? config.reasoningEffort {
+        templateContext["reasoning_effort"] = effort
+    }
     let userInput = UserInput(chat: chatMessages, tools: toolSpecs, additionalContext: templateContext)
     print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audios.count) audio inputs.")
     let lmInput = try await container.prepare(input: userInput)
@@ -4779,6 +4791,9 @@ struct ChatCompletionRequest: Decodable {
     let thinkingBudget: Int?
     /// Top-level thinking override emitted by Aegis-AI gateway
     let enableThinking: Bool?
+    /// OpenAI-style `reasoning_effort` (low/medium/high); forwarded to the chat template
+    /// as `reasoning_effort`. Overrides `--reasoning-effort`.
+    let reasoningEffort: String?
     /// Number of bits for native MLX quantized KV cache (nil = no quantization).
     /// Only 4 and 8 are supported by the underlying MLX QuantizedKVCache.
     /// Enables `QuantizedKVCache` instead of `KVCacheSimple`.  Separate from `--turbo-kv`.
@@ -4798,6 +4813,7 @@ struct ChatCompletionRequest: Decodable {
         case responseFormat = "response_format"
         case chatTemplateKwargs = "chat_template_kwargs"
         case enableThinking = "enable_thinking"
+        case reasoningEffort = "reasoning_effort"
         case thinkingBudget = "thinking_budget"
         case kvBits = "kv_bits"
     }
