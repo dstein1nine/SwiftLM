@@ -663,6 +663,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable 16-worker background SSD thread pool queue (PAPPS). Requires --stream-experts.")
     var ssdPrefetch: Bool = false
 
+    @Option(name: .long, help: "Wired GPU memory cap in GB (MLX wired limit), held for the life of the server. Without one, nothing is wired and the kernel re-establishes GPU residency on every submission, which stalled K2.6 streaming decode 4x. 0 disables. Default: Metal's recommended working set when --stream-experts is on, otherwise unset")
+    var wiredLimitGb: Int?
+
     @Flag(name: .long, help: "Enable TurboQuant KV-cache compression (3-bit PolarQuant+QJL). Compresses KV history > 8192 tokens to ~3.5 bits/token — recommended for 100k+ context. Default: disabled")
     var turboKV: Bool = false
 
@@ -1338,6 +1341,20 @@ struct MLXServer: AsyncParsableCommand {
             } else {
                 print("[SwiftLM] ⚠️  Model does not support layer partitioning (architecture not yet adapted)")
             }
+        }
+
+        // ── Wired GPU memory ──
+        // A ticket started and never ended holds the limit for the process lifetime.
+        let wiredLimitBytes: Int? = {
+            if let gb = self.wiredLimitGb { return gb > 0 ? gb * 1024 * 1024 * 1024 : nil }
+            return self.streamExperts ? GPU.maxRecommendedWorkingSetBytes() : nil
+        }()
+        if let requested = wiredLimitBytes {
+            let gb = requested / (1024 * 1024 * 1024)
+            let ticket = WiredMemoryTicket(size: requested, policy: MLX.WiredSumPolicy())
+            let applied = await ticket.start()
+            let recommended = GPU.maxRecommendedWorkingSetBytes() ?? 0
+            print("[SwiftLM] 📌 Wired limit: requested \(gb) GB, applied \(applied / (1024 * 1024 * 1024)) GB (Metal recommended working set \(recommended / (1024 * 1024 * 1024)) GB)")
         }
 
         // ── Apply SSD Expert Streaming ──
