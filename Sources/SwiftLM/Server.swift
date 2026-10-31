@@ -742,6 +742,13 @@ struct MLXServer: AsyncParsableCommand {
         if self.draftModel != nil || self.streamExperts || self.mtp {
             setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
         }
+        // MLX also commits after 50 MB of inputs per command buffer (M3 Ultra default),
+        // and every streamed expert matmul reads a stacked slot buffer larger than that,
+        // so decode committed after almost every expert op. The ops cap above still
+        // bounds buffer length. Halves command buffers per token; user value wins.
+        if self.streamExperts {
+            setenv("MLX_MAX_MB_PER_BUFFER", "100000", 0)
+        }
 
         if self.mtp {
             setenv("SWIFTLM_MTP_ENABLE", "1", 1)
