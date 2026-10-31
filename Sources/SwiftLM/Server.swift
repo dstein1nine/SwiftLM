@@ -2080,7 +2080,9 @@ actor PromptCache {
         // save time so cached.tokens.count === cached state's T.
         let states: [[MLXArray]] = cache.map { layer -> [MLXArray] in
             let s = layer.state
-            if layer is KVCacheSimple {
+            // The generic save runs after the first decode token, so the live state holds
+            // one token more than `tokens`.
+            if layer is KVCacheSimple || isSimpleCacheList(layer) {
                 return s.map { arr -> MLXArray in
                     guard arr.ndim >= 3 else { return arr }
                     let T = arr.dim(2)
@@ -2193,6 +2195,7 @@ actor PromptCache {
         // a recurrent layer as a miss before we touch anything.
         let hasRecurrentLayer = cache.contains { layer in
             !(layer is KVCacheSimple) && !(String(describing: type(of: layer)).contains("Rotating"))
+                && !isSimpleCacheList(layer)
         }
         if hasRecurrentLayer {
             misses += 1
@@ -2217,8 +2220,15 @@ actor PromptCache {
         // live cache cannot write through into the saved snapshot.
         for i in 0..<min(cache.count, cached.states.count) {
             var layer = cache[i]
-            layer.state = cached.states[i].map(detachedArray)
-            layer.metaState = cached.metaStates[i]
+            let state = cached.states[i].map(detachedArray)
+            if let list = layer as? CacheList {
+                // usableMatch already checked the layout; its KVCacheSimple children have
+                // no metaState to restore.
+                _ = restoreCacheList(list, state: state, metaState: cached.metaStates[i])
+            } else {
+                layer.state = state
+                layer.metaState = cached.metaStates[i]
+            }
         }
         if excess > 0 {
             for layer in cache { layer.trim(excess) }
@@ -2234,6 +2244,10 @@ actor PromptCache {
         guard !entry.tokens.isEmpty else { return nil }
         let matchLen = Self.commonPrefixLength(entry.tokens, newTokens)
         guard matchLen > 0 else { return nil }
+        for i in 0..<min(cache.count, entry.states.count) {
+            guard let list = cache[i] as? CacheList else { continue }
+            guard Int(entry.metaStates[i].first ?? "") == list.count else { return nil }
+        }
         // Pre-flight safety check: compute the minimum sequence length across
         // all cached layers. Sliding-window layers (RotatingKVCache) store far
         // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
@@ -2415,6 +2429,38 @@ func sliceText(_ text: LMInput.Text, from start: Int, to end: Int? = nil) -> LMI
 /// VLM/Omni loads are skipped except for models whose text-only path is stateless: the
 /// Qwen-VL family needs the LMOutput.State (ropeDeltas) of the cached prefix, which the
 /// cache does not store.
+/// A `CacheList` whose children are all plain `KVCacheSimple`: DeepSeek V3.2 / GLM-5 /
+/// Kimi K2 (DSA) layers pair the attention KV with the indexer's keys, all `[B, H, T, D]`.
+/// It trims and restores like a `KVCacheSimple`. Lists holding ring buffers (`--ctx-size`)
+/// or recurrent state are not, and stay uncached.
+func isSimpleCacheList(_ layer: KVCache) -> Bool {
+    guard let list = layer as? CacheList, list.count > 0 else { return false }
+    return (0 ..< list.count).allSatisfy { type(of: list[$0]) == KVCacheSimple.self }
+}
+
+/// Put saved `state` back into a `CacheList`. Its own state setter splits the arrays by
+/// how many each child holds now, which is none for a fresh cache, so it would silently
+/// restore nothing. The saved metaState records each child's count:
+/// `[childCount, (className, stateCount, metaCount, meta...)*]`.
+func restoreCacheList(_ list: CacheList, state: [MLXArray], metaState: [String]) -> Bool {
+    guard let children = metaState.first.flatMap({ Int($0) }), children == list.count else {
+        return false
+    }
+    var m = 1
+    var start = 0
+    for i in 0 ..< children {
+        guard m + 2 < metaState.count,
+            let stateCount = Int(metaState[m + 1]), let metaCount = Int(metaState[m + 2]),
+            start + stateCount <= state.count
+        else { return false }
+        var child = list[i]
+        child.state = Array(state[start ..< start + stateCount])
+        start += stateCount
+        m += 3 + metaCount
+    }
+    return start == state.count
+}
+
 func shouldSkipPromptCache(
     isMultimodalRequest: Bool, kvBitsSet: Bool, isVLM: Bool, vlmTextCacheSafe: Bool
 ) -> Bool {

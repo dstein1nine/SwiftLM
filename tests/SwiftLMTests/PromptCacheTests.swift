@@ -132,6 +132,35 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertNil(result, "Recurrent layer (ArraysCache) -> restore must bail")
     }
 
+    /// DSA models (Kimi K2, GLM-5, DeepSeek V3.2) give each layer a CacheList of the
+    /// attention KV and the indexer keys. The generic save runs one decode token after the
+    /// prompt, so both children are sliced back to the prompt and restore as a prefix hit.
+    func testRestore_SimpleCacheListPrefixHit() async {
+        let pc = PromptCache()
+        let main = makePopulatedSimpleCache(seqLen: 6)
+        let indexer = KVCacheSimple()
+        _ = indexer.update(
+            keys: MLXArray.ones([1, 1, 6, 4], dtype: .float16),
+            values: MLXArray.zeros([1, 1, 6, 0], dtype: .float16))
+        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [CacheList(main, indexer)])
+
+        let fresh = CacheList(KVCacheSimple(), KVCacheSimple())
+        let result = await pc.restore(newTokens: [1, 2, 3, 4, 5, 6, 7], into: [fresh])
+        XCTAssertEqual(result, 5, "the saved prompt is a prefix of the next turn")
+        XCTAssertEqual(fresh[0].offset, 5)
+        XCTAssertEqual(fresh[1].offset, 5)
+        XCTAssertEqual(fresh.state.map { $0.dim(2) }, [5, 5, 5, 5])
+    }
+
+    /// A CacheList holding a ring buffer cannot be sliced or trimmed like one: miss.
+    func testRestore_CacheListWithRotatingChildMisses() async {
+        let pc = PromptCache()
+        await pc.save(tokens: [1, 2, 3], cache: [makePopulatedSimpleCache(seqLen: 3)])
+        let list = CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 8, keep: 4))
+        let result = await pc.restore(newTokens: [1, 2, 3, 4], into: [list])
+        XCTAssertNil(result)
+    }
+
     /// Basic happy path: save and restore with identical tokens -> full match.
     func testRestore_FullMatch() async {
         let pc = PromptCache()
