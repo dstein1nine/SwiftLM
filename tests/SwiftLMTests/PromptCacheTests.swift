@@ -152,6 +152,34 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(fresh.state.map { $0.dim(2) }, [5, 5, 5, 5])
     }
 
+    /// After generation the cache holds the prompt plus every token the iterator returned;
+    /// only those reply tokens are saved alongside the prompt.
+    func testReplyTokensInCache_CoversFedTokensOnly() {
+        let simple = makePopulatedSimpleCache(seqLen: 7)
+        XCTAssertEqual(replyTokensInCache([8, 9, 10], promptLength: 5, cache: [simple]), [8, 9])
+        XCTAssertEqual(replyTokensInCache([8, 9], promptLength: 7, cache: [simple]), [])
+
+        let indexer = KVCacheSimple()
+        _ = indexer.update(
+            keys: MLXArray.ones([1, 1, 7, 4], dtype: .float16),
+            values: MLXArray.zeros([1, 1, 7, 0], dtype: .float16))
+        let list = CacheList(makePopulatedSimpleCache(seqLen: 7), indexer)
+        XCTAssertEqual(replyTokensInCache([8, 9, 10], promptLength: 4, cache: [list, simple]), [8, 9, 10])
+        XCTAssertEqual(replyTokensInCache([8], promptLength: 4, cache: [RotatingKVCache(maxSize: 8, keep: 4)]), [])
+    }
+
+    /// A saved prompt plus reply restores for the next turn, which re-sends that reply.
+    func testRestore_PromptPlusReplyPrefixHit() async {
+        let pc = PromptCache()
+        let cache = makePopulatedSimpleCache(seqLen: 6)
+        await pc.save(tokens: [1, 2, 3] + replyTokensInCache([4, 5, 6, 7], promptLength: 3, cache: [cache]),
+                      cache: [cache])
+        let fresh = KVCacheSimple()
+        let result = await pc.restore(newTokens: [1, 2, 3, 4, 5, 6, 99, 100], into: [fresh])
+        XCTAssertEqual(result, 6)
+        XCTAssertEqual(fresh.offset, 6)
+    }
+
     /// A CacheList holding a ring buffer cannot be sliced or trimmed like one: miss.
     func testRestore_CacheListWithRotatingChildMisses() async {
         let pc = PromptCache()

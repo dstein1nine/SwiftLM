@@ -1977,8 +1977,8 @@ actor PromptCache {
     /// How many trailing tokens of a saved prompt a newer prompt may drop or rewrite and
     /// still replace it (see `isSuperseded`).
     ///
-    /// The generic save runs after the first decode token, so the prompt it saves ends with
-    /// the generation prompt (`<|im_start|>assistant\n<think>\n`). Templates that re-render
+    /// The generic save runs after generation, so the tokens it saves end with the generation
+    /// prompt (`<|im_start|>assistant\n<think>\n`) and the reply. Templates that re-render
     /// history (Qwen3 reasoning templates drop or rewrite it) and edits or regenerations of
     /// the last message make the next turn diverge from the previous prompt only in its
     /// last few tokens, so the old prompt is no longer an exact prefix even though it is
@@ -2080,8 +2080,8 @@ actor PromptCache {
         // save time so cached.tokens.count === cached state's T.
         let states: [[MLXArray]] = cache.map { layer -> [MLXArray] in
             let s = layer.state
-            // The generic save runs after the first decode token, so the live state holds
-            // one token more than `tokens`.
+            // The generic save runs after generation, so the live state can hold tokens past
+            // `tokens` (the last one sampled, or a reply the caller left out).
             if layer is KVCacheSimple || isSimpleCacheList(layer) {
                 return s.map { arr -> MLXArray in
                     guard arr.ndim >= 3 else { return arr }
@@ -2438,6 +2438,19 @@ func isSimpleCacheList(_ layer: KVCache) -> Bool {
     return (0 ..< list.count).allSatisfy { type(of: list[$0]) == KVCacheSimple.self }
 }
 
+/// The generated tokens whose KV state `cache` holds after generation: the iterator feeds
+/// each token it returns before returning it, so the cache runs past the prompt by however
+/// many of `generated` it consumed. Empty when the cache's length cannot be read.
+func replyTokensInCache(_ generated: [Int], promptLength: Int, cache: [KVCache]) -> [Int] {
+    let lengths = cache.compactMap { layer -> Int? in
+        if let simple = layer as? KVCacheSimple { return simple.offset }
+        if isSimpleCacheList(layer), let list = layer as? CacheList { return list[0].offset }
+        return nil
+    }
+    guard let length = lengths.min() else { return [] }
+    return Array(generated.prefix(max(0, length - promptLength)))
+}
+
 /// Put saved `state` back into a `CacheList`. Its own state setter splits the arrays by
 /// how many each child holds now, which is none for a fresh cache, so it would silently
 /// restore nothing. The saved metaState records each child's count:
@@ -2778,7 +2791,7 @@ func handleChatCompletion(
     // leave the client staring at a silent connection (client idle-timeout →
     // ECONNRESET → retry with an ever-grown payload). Non-streaming awaits it
     // inline, exactly as before. (Body indentation intentionally unchanged.)
-    let startGeneration: () async throws -> (AsyncStream<Generation>, (() async -> Void)?) = {
+    let startGeneration: () async throws -> (AsyncStream<Generation>, (([Int]) async -> Void)?) = {
     // ── DFlash block-diffusion speculative decoding ──
     // When --dflash is enabled and both DFlash draft model and target model conform
     // to DFlashTargetModel, we use DFlashRuntime.generate instead of the standard path.
@@ -2813,7 +2826,7 @@ func handleChatCompletion(
     }
 
     // ── Cache-aware generation (standard path) ──
-    let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
+    let (stream, onGenerationDone) = try await container.perform { context -> (AsyncStream<Generation>, (([Int]) async -> Void)?) in
         let cache = try context.model.newCache(parameters: params)
 
         // ── TurboQuant: enable 3-bit KV compression on every KVCacheSimple layer ──
@@ -2867,7 +2880,7 @@ func handleChatCompletion(
         // layers (RotatingKVCache under --ctx-size; this path must run before the
         // sliding-window one, which misses on any MambaCache), and the generic path below
         // refuses them: recurrent state cannot be
-        // trimmed, and the onPrefillDone save runs once the producer has emitted `.info`.
+        // trimmed, and the onGenerationDone save runs once the producer has emitted `.info`.
         // Without this, every agent turn re-prefills the whole conversation. Instead:
         // resume from an exact cached prefix, prefill to the turn boundary, snapshot there
         // synchronously, then generate the few tokens after it.
@@ -3009,7 +3022,7 @@ func handleChatCompletion(
             }
             return false
         }
-        let onPrefillDone: (() async -> Void)? = {
+        let onGenerationDone: (([Int]) async -> Void)? = { generated in
             // The hybrid path already saved at its boundary; a save here would capture
             // recurrent state one decode token too late.
             guard hybridBoundary == nil, rotatingBoundary == nil else { return }
@@ -3025,12 +3038,17 @@ func handleChatCompletion(
                 // format is incompatible with the FP16 KVCacheSimple format expected by
                 // promptCache.save. Skip saving to prevent unsafe mixed-format restores.
             } else {
-                await promptCache.save(tokens: promptTokens, cache: cache)
+                // Save the reply along with the prompt: the next turn re-sends it as history,
+                // so a follow-up only prefills the new user message instead of the reply.
+                await promptCache.save(
+                    tokens: promptTokens
+                        + replyTokensInCache(generated, promptLength: promptLength, cache: cache),
+                    cache: cache)
             }
         }
-        return (stream, onPrefillDone)
+        return (stream, onGenerationDone)
     }
-        return (stream, onPrefillDone)
+        return (stream, onGenerationDone)
     }  // end startGeneration
 
     if isStream {
@@ -3043,13 +3061,13 @@ func handleChatCompletion(
             emitPrefillProgress: emitPrefillProgress
         )
     } else {
-        let (stream, onPrefillDone) = try await startGeneration()
+        let (stream, onGenerationDone) = try await startGeneration()
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
             thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
             slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
-            onPrefillDone: onPrefillDone
+            onGenerationDone: onGenerationDone
         )
     }
 }
@@ -3248,7 +3266,7 @@ func jsonModeFlushText(_ buffered: String) -> String {
 }
 
 func handleChatStreaming(
-    startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (() async -> Void)?),
+    startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (([Int]) async -> Void)?),
     modelId: String,
     stopSequences: [String],
     includeUsage: Bool,
@@ -3340,7 +3358,7 @@ func handleChatStreaming(
         // Start generation only now — the response headers are already on the
         // wire, so even a multi-second prefill leaves an idle-timeout-free
         // connection (heartbeat chunks flow if the client opted in).
-        let generation: (stream: AsyncStream<Generation>, onPrefillDone: (() async -> Void)?)
+        let generation: (stream: AsyncStream<Generation>, onGenerationDone: (([Int]) async -> Void)?)
         do {
             generation = try await startGeneration()
         } catch {
@@ -3350,7 +3368,7 @@ func handleChatStreaming(
             return
         }
         let stream = generation.stream
-        let onPrefillDone = generation.onPrefillDone
+        let onGenerationDone = generation.onGenerationDone
 
         // ── JSON mode streaming: buffer early tokens to strip hallucinated prefixes ──
         var jsonBuffering = jsonMode
@@ -3518,7 +3536,7 @@ func handleChatStreaming(
                 // it arrives. The prompt is saved here, not on the first chunk: that raced the
                 // decode step the producer had already started on the same KVCacheSimple. An
                 // early exit (stop sequence, disconnect) never reaches `.info` and skips the save.
-                if !firstToken, let onPrefillDone { await onPrefillDone() }
+                if !firstToken, let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
                 // The chunk count undercounts: tokens the decoder buffers (tool-call
                 // bodies, partial text) emit no chunk. `info` carries the real count.
                 completionTokenCount = info.generationTokenCount
@@ -3640,7 +3658,7 @@ func handleChatNonStreaming(
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    onPrefillDone: (() async -> Void)? = nil
+    onGenerationDone: (([Int]) async -> Void)? = nil
 ) async throws -> Response {
     var fullText = ""
     var completionTokenCount = 0
@@ -3694,7 +3712,7 @@ func handleChatNonStreaming(
         case .info(let info):
             // The producer's last yield; see the matching comment in `handleChatStreaming`.
             // The stop-sequence `break` above exits before `.info`, so it skips the save.
-            if !firstToken, let onPrefillDone { await onPrefillDone() }
+            if !firstToken, let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
         }
