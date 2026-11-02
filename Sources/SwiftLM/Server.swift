@@ -768,6 +768,7 @@ struct MLXServer: AsyncParsableCommand {
 
         // Register SwiftLM-owned DFlash model types before any model loading.
         await registerDFlashModelTypes()
+        await registerOverlayModelTypes()
 
         print("[SwiftLM] Loading model: \(model)")
         let modelId = model
