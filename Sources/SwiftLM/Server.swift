@@ -1528,7 +1528,8 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // ── Build Hummingbird router ──
-        let router = Router()
+        // The non-streaming handlers need the connection to notice a client leaving.
+        let router = Router(context: ConnectionRequestContext.self)
 
         // ── CORS middleware ──
         if let origin = corsOrigin {
@@ -1617,7 +1618,7 @@ struct MLXServer: AsyncParsableCommand {
             }
         }
         memoryPressure.resume()
-        router.post("/v1/chat/completions") { request, _ -> Response in
+        router.post("/v1/chat/completions") { request, context -> Response in
             do {
                 let bodyData = try await collectBody(request)
                 return try await handleChatCompletion(
@@ -1625,7 +1626,8 @@ struct MLXServer: AsyncParsableCommand {
                     draftModelRef: draftModelRef, numDraftTokens: numDraftTokensConfig,
                     dflashModel: dflashModel, dflashBlockSize: dflashBlockSizeConfig,
                     dflashTargetModel: dflashTargetModel,
-                    mtpAssistant: loadedMTPAssistant
+                    mtpAssistant: loadedMTPAssistant,
+                    channel: context.channel
                 )
             } catch {
                 return Response(
@@ -1637,11 +1639,12 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // Text completions — handler extracted to avoid type-checker timeout
-        router.post("/v1/completions") { request, _ -> Response in
+        router.post("/v1/completions") { request, context -> Response in
             do {
                 let bodyData = try await collectBody(request)
                 return try await handleTextCompletion(
-                    request: request, bodyData: bodyData, config: config, container: container, semaphore: semaphore, stats: stats
+                    request: request, bodyData: bodyData, config: config, container: container, semaphore: semaphore, stats: stats,
+                    channel: context.channel
                 )
             } catch {
                 return Response(
@@ -2580,7 +2583,8 @@ func handleChatCompletion(
     dflashModel: DFlashDraftModel? = nil,
     dflashBlockSize: Int? = nil,
     dflashTargetModel: (any DFlashTargetModel)? = nil,
-    mtpAssistant: (any DualModelMTP)? = nil
+    mtpAssistant: (any DualModelMTP)? = nil,
+    channel: (any Channel)? = nil
 ) async throws -> Response {
     let chatReq: ChatCompletionRequest
     do {
@@ -2827,6 +2831,13 @@ func handleChatCompletion(
 
     // ── Cache-aware generation (standard path) ──
     let (stream, onGenerationDone) = try await container.perform { context -> (AsyncStream<Generation>, (([Int]) async -> Void)?) in
+        // mlx-swift-lm can route a model's thinking into separate `.reasoning` events, with the
+        // delimiters removed. This server splits `<think>…</think>` out of `.chunk` text itself
+        // (`ThinkingStateTracker`) and maps it to `reasoning_content`, so the generation loop is
+        // given a context without a reasoning protocol and keeps emitting the text inline. The
+        // thinking budget above still reads the real config from the container.
+        var context = context
+        context.configuration.reasoningConfig = nil
         let cache = try context.model.newCache(parameters: params)
 
         // ── TurboQuant: enable 3-bit KV compression on every KVCacheSimple layer ──
@@ -2903,6 +2914,26 @@ func handleChatCompletion(
                     context.tokenizer.convertTokenToId("<|turn>"),
                     context.tokenizer.convertTokenToId("<|im_start|>"),
                 ])
+        // ── Full-attention prompt cache ──
+        // Saving once the producer has emitted `.info` misses every request that ends early:
+        // a stop sequence or a client disconnect leaves the stream before `.info`, so the
+        // next turn re-prefills the whole history (#245). Snapshot at the turn boundary
+        // instead, as the paths above do: prefill the prompt but its last token
+        // synchronously, save, and let generation feed the last token. No decode step has
+        // started, so nothing is writing the cache while it is read. The saved prefix is one
+        // token short of the prompt; restore replays that token anyway.
+        let saveAtBoundary = !skipPromptCache && hybridBoundary == nil && rotatingBoundary == nil
+            && draftModelRef == nil && !config.mtp && !config.turboKV && !hasRotatingLayer
+            && promptLength > 1
+        func snapshotPrompt(from start: Int) async throws -> Int {
+            let boundary = promptLength - 1
+            guard saveAtBoundary, start < boundary else { return start }
+            _ = try TokenIterator(
+                input: LMInput(text: sliceText(lmInput.text, from: start, to: boundary)),
+                model: context.model, cache: cache, parameters: params)
+            await promptCache.save(tokens: Array(promptTokens[..<boundary]), cache: cache)
+            return boundary
+        }
         var stream: AsyncStream<Generation>
         if let boundary = hybridBoundary {
             let start = await promptCache.restoreExactPrefix(
@@ -2981,6 +3012,7 @@ func handleChatCompletion(
                 // Trim the KV cache back by 1 to avoid double-counting the replayed token.
                 for layer in cache { layer.trim(1) }
             }
+            startIndex = try await snapshotPrompt(from: startIndex)
             let trimmedInput = LMInput(text: sliceText(lmInput.text, from: startIndex))
             if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
@@ -2999,9 +3031,10 @@ func handleChatCompletion(
                     input: lmInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
                 )
             } else {
+                let start = try await snapshotPrompt(from: 0)
                 stream = try MLXLMCommon.generate(
-                    input: lmInput, cache: cache, parameters: params, context: context,
-                    components: genComponents
+                    input: start == 0 ? lmInput : LMInput(text: sliceText(lmInput.text, from: start)),
+                    cache: cache, parameters: params, context: context, components: genComponents
                 )
             }
         }
@@ -3026,6 +3059,8 @@ func handleChatCompletion(
             // The hybrid path already saved at its boundary; a save here would capture
             // recurrent state one decode token too late.
             guard hybridBoundary == nil, rotatingBoundary == nil else { return }
+            // The boundary save above keeps the prompt for turns that end early; this one, when
+            // generation finishes, extends it with the reply and supersedes it.
             // Nothing would ever restore it (see skipPromptCache above).
             guard !skipPromptCache else { return }
             // A ring buffer cannot be snapshotted after the first decode token (the MTP,
@@ -3061,14 +3096,21 @@ func handleChatCompletion(
             emitPrefillProgress: emitPrefillProgress
         )
     } else {
-        let (stream, onGenerationDone) = try await startGeneration()
-        return try await handleChatNonStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
-            slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
-            onGenerationDone: onGenerationDone
-        )
+        // A client may give up during a long answer, and nothing on this path would
+        // notice: the SSE path learns of a disconnect from a failed write, but a
+        // non-streaming response writes nothing until the end. The generation then ran
+        // to max_tokens for nobody and held the slot the whole time (and with the
+        // default --parallel 1, every later request behind it).
+        return try await cancellingOnClientDisconnect(channel) { [enableThinking, thinkingPreOpened] in
+            let (stream, onGenerationDone) = try await startGeneration()
+            return try await handleChatNonStreaming(
+                stream: stream, modelId: modelId, stopSequences: stopSequences,
+                promptTokenCount: promptTokenCount, enableThinking: enableThinking,
+                thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
+                slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
+                onGenerationDone: onGenerationDone
+            )
+        }
     }
 }
 
@@ -3535,8 +3577,12 @@ func handleChatStreaming(
                 // `.info` is the producer's last yield, so the cache is no longer written once
                 // it arrives. The prompt is saved here, not on the first chunk: that raced the
                 // decode step the producer had already started on the same KVCacheSimple. An
-                // early exit (stop sequence, disconnect) never reaches `.info` and skips the save.
-                if !firstToken, let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
+                // early exit (stop sequence, disconnect) never reaches `.info`, so the
+                // full-attention path saves at the prompt boundary before generating instead
+                // (`saveAtBoundary`); only the paths that still save here skip on early exit.
+                // The save does not wait for a chunk: a turn that is only a tool call never
+                // yields one, and its prompt is exactly what the next turn of the loop needs.
+                if let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
                 // The chunk count undercounts: tokens the decoder buffers (tool-call
                 // bodies, partial text) emit no chunk. `info` carries the real count.
                 completionTokenCount = info.generationTokenCount
@@ -3611,6 +3657,10 @@ func handleChatStreaming(
                         fflush(stdout)
                     }
                 }
+            default:
+                // Events this build does not model (mlx-swift-lm's `.reasoning`, from the 2026-10
+                // upstream sync) are ignored: SwiftLM still splits `<think>` out of `.chunk` text itself.
+                break
             }
         }
         // Safety net: the tail is normally released in `case .info`, but a stream that
@@ -3711,10 +3761,15 @@ func handleChatNonStreaming(
             print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
         case .info(let info):
             // The producer's last yield; see the matching comment in `handleChatStreaming`.
-            // The stop-sequence `break` above exits before `.info`, so it skips the save.
-            if !firstToken, let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
+            // The stop-sequence `break` above exits before `.info`; the paths that save at the
+            // prompt boundary are unaffected, the others skip the save.
+            if let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
+        default:
+            // Events this build does not model (mlx-swift-lm's `.reasoning`, from the 2026-10
+            // upstream sync) are ignored: SwiftLM still splits `<think>` out of `.chunk` text itself.
+            break
         }
     }
     print("")  // end the real-time token stream line
@@ -3845,7 +3900,8 @@ func handleTextCompletion(
     config: ServerConfig,
     container: ModelContainer,
     semaphore: AsyncSemaphore,
-    stats: ServerStats
+    stats: ServerStats,
+    channel: (any Channel)? = nil
 ) async throws -> Response {
     let compReq: TextCompletionRequest
     do {
@@ -3910,11 +3966,14 @@ func handleTextCompletion(
             genStart: genStart, emitPrefillProgress: emitPrefillProgress
         )
     } else {
-        let stream = try await container.generate(input: lmInput, parameters: params)
-        return try await handleTextNonStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, slot: slot, stats: stats, genStart: genStart
-        )
+        // Same as the chat path: stop generating if the client goes away.
+        return try await cancellingOnClientDisconnect(channel) {
+            let stream = try await container.generate(input: lmInput, parameters: params)
+            return try await handleTextNonStreaming(
+                stream: stream, modelId: modelId, stopSequences: stopSequences,
+                promptTokenCount: promptTokenCount, slot: slot, stats: stats, genStart: genStart
+            )
+        }
     }
 }
 
@@ -4057,6 +4116,10 @@ func handleTextStreaming(
                     cont.yield("data: [DONE]\n\n")
                     cont.finish()
                 }
+            default:
+                // Events this build does not model (mlx-swift-lm's `.reasoning`, from the 2026-10
+                // upstream sync) are ignored: SwiftLM still splits `<think>` out of `.chunk` text itself.
+                break
             }
         }
         // The tail never became a stop sequence, so it is ordinary output. Normally
@@ -4111,6 +4174,10 @@ func handleTextNonStreaming(
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
         case .toolCall, .rejectedToolCall:
+            break
+        default:
+            // Events this build does not model (mlx-swift-lm's `.reasoning`, from the 2026-10
+            // upstream sync) are ignored: SwiftLM still splits `<think>` out of `.chunk` text itself.
             break
         }
     }
@@ -4223,6 +4290,106 @@ final class GenerationSlot: @unchecked Sendable {
     deinit {
         release()
     }
+}
+
+// ── Client disconnect (non-streaming) ─────────────────────────────────────────
+
+/// Request context that keeps the connection's channel. `BasicRequestContext` drops it,
+/// and the non-streaming handlers need it to find out when the client goes away.
+struct ConnectionRequestContext: RequestContext {
+    var coreContext: CoreRequestContextStorage
+    let channel: any Channel
+
+    init(source: ApplicationRequestContextSource) {
+        coreContext = .init(source: source)
+        channel = source.channel
+    }
+}
+
+/// Reports, once, that the client of a connection has stopped listening.
+///
+/// Hummingbird enables remote half-closure on its connections, so a client that closes
+/// its socket mid-request shows up as `ChannelEvent.inputClosed`, not as a closed
+/// channel; a reset shows up as `channelInactive`. The streaming handlers need neither,
+/// because their next write fails and tears down the body stream, but a non-streaming
+/// handler writes nothing until the end, so this is its only signal.
+///
+/// Installed at the head of the pipeline for the span of one request and removed after
+/// it, so a keep-alive connection closing between requests is not taken for a client
+/// abandoning one. Both callbacks run on the channel's event loop, and `fired` is only
+/// touched there.
+final class ClientDisconnectWatch: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+
+    private let onDisconnect: @Sendable () -> Void
+    private var fired = false
+
+    init(onDisconnect: @escaping @Sendable () -> Void) {
+        self.onDisconnect = onDisconnect
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if (event as? ChannelEvent) == .inputClosed { fire() }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        fire()
+        context.fireChannelInactive()
+    }
+
+    private func fire() {
+        guard !fired else { return }
+        fired = true
+        onDisconnect()
+    }
+}
+
+/// A cancel request that may arrive before the task it is meant for exists.
+final class DeferredCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var cancelTask: (@Sendable () -> Void)?
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let cancelTask = self.cancelTask
+        lock.unlock()
+        cancelTask?()
+    }
+
+    func attach<T: Sendable, E: Error>(_ task: Task<T, E>) {
+        lock.lock()
+        cancelTask = { task.cancel() }
+        let cancelled = self.cancelled
+        lock.unlock()
+        if cancelled { task.cancel() }
+    }
+}
+
+/// Runs `body`, a non-streaming generation, and cancels it if the client disconnects
+/// meanwhile. Cancellation reaches the producer through the generation stream, the
+/// same way it does when an SSE consumer is cancelled: the model stops after the token
+/// in flight, the handler falls out of its loop and releases the slot, and the response
+/// it builds goes to a closed socket. With no channel (tests), `body` just runs.
+func cancellingOnClientDisconnect<T: Sendable>(
+    _ channel: (any Channel)?, _ body: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    guard let channel else { return try await body() }
+    let cancellation = DeferredCancellation()
+    let watch = ClientDisconnectWatch { cancellation.cancel() }
+    // Installed before the work starts, so a disconnect in between is not missed. If
+    // the channel is already closed the install fails, and the client has left.
+    do {
+        try await channel.pipeline.addHandler(watch, position: .first).get()
+    } catch {
+        cancellation.cancel()
+    }
+    defer { channel.pipeline.removeHandler(watch, promise: nil) }
+    let work = Task { try await body() }
+    cancellation.attach(work)
+    return try await work.value
 }
 
 // ── CORS Middleware ───────────────────────────────────────────────────────────
