@@ -669,8 +669,8 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable TurboQuant KV-cache compression (3-bit PolarQuant+QJL). Compresses KV history > 8192 tokens to ~3.5 bits/token — recommended for 100k+ context. Default: disabled")
     var turboKV: Bool = false
 
-    @Option(name: .long, help: "Chunk size for prefill evaluation (default: 512, lower to prevent GPU timeout on large models)")
-    var prefillSize: Int = 512
+    @Option(name: .long, help: "Chunk size for prefill evaluation (default: 4096 with --stream-experts, otherwise 512; lower to prevent GPU timeout on large models). Streaming reads every expert a chunk routes to, so each chunk costs about one pass over the experts.")
+    var prefillSize: Int?
 
     @Option(name: .long, help: "Draft model for speculative decoding (local path or HuggingFace ID). Must share tokenizer with main model.")
     var draftModel: String?
@@ -1486,7 +1486,9 @@ struct MLXServer: AsyncParsableCommand {
             promptCacheEntries: self.promptCacheEntries,
             tokenEcho: !self.noTokenEcho,
             isVision: loadedAsVision,
-            prefillSize: self.prefillSize,
+            // A K2.6 chunk of 512 routes to nearly every expert, so streaming reread ~420 GB per
+            // 512 tokens. 4096: a 2.9K-token prompt took 92 s instead of 305 s (352 vs 1541 GB read).
+            prefillSize: self.prefillSize ?? (self.streamExperts ? 4096 : 512),
             turboKV: self.turboKV,
             mtp: self.mtp,
             numMtpTokens: self.numMtpTokens,
@@ -1713,6 +1715,8 @@ struct MLXServer: AsyncParsableCommand {
                     ("swiftlm_stream_prefetched_experts_total", "counter", "Experts read ahead of routing", "\(engine.prefetchedUnits)"),
                     ("swiftlm_stream_bytes_read_total", "counter", "Bytes read by the stream engine", "\(engine.bytesRead)"),
                     ("swiftlm_stream_read_seconds_total", "counter", "Wall time spent in stream engine reads", String(format: "%.3f", Double(engine.readNanos) / 1e9)),
+                    ("swiftlm_stream_prompt_bytes_read_total", "counter", "Expert bytes read by prompt prefill", "\(engine.promptBytesRead)"),
+                    ("swiftlm_stream_prompt_read_seconds_total", "counter", "Wall time spent in prompt prefill expert reads", String(format: "%.3f", Double(engine.promptReadNanos) / 1e9)),
                 ] {
                     lines.append("# HELP \(name) \(help)")
                     lines.append("# TYPE \(name) \(type)")
