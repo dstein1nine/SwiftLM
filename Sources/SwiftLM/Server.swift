@@ -2383,6 +2383,17 @@ func hybridCacheBoundary(promptTokens: [Int], imStartId: Int?, cache: [KVCache])
     return boundary
 }
 
+/// Where a cache that can only be snapshotted (every layer a `PrefixSnapshotKVCache`, such as
+/// DeepSeek V4.1's) may save: the last `<｜Assistant｜>`, the start of the reply being generated.
+/// It takes the hybrid path, which restores exact prefixes and saves before decoding.
+func snapshotCacheBoundary(promptTokens: [Int], assistantId: Int?, cache: [KVCache]) -> Int? {
+    guard let assistantId, !cache.isEmpty,
+          cache.allSatisfy({ $0 is PrefixSnapshotKVCache }),
+          let boundary = promptTokens.lastIndex(of: assistantId), boundary > 0
+    else { return nil }
+    return boundary
+}
+
 /// Prompt positions at which a hybrid prefill from `start` to `boundary` should snapshot
 /// its recurrent state: turn starts, so a later prompt that edits history shares a prefix
 /// that ends on a turn boundary. A cold prefill (`start == 0`) first takes the turn after
@@ -2885,7 +2896,10 @@ func handleChatCompletion(
         // Checked on the model type rather than config.isVision so --audio
         // (OmniModelFactory) loads are covered as well.
         let isVLM = context.model is any VLMModel
-        let vlmTextCacheSafe = context.model is MLXVLM.Gemma4 && !config.mtp && mtpAssistant == nil
+        // DeepSeek V4.1 is text-only; it is registered as a VLM for its loader.
+        let vlmTextCacheSafe =
+            (context.model is MLXVLM.Gemma4 || context.model is MLXVLM.SharpAIDeepseekV41Model)
+            && !config.mtp && mtpAssistant == nil
         let skipPromptCache = shouldSkipPromptCache(
             isMultimodalRequest: isMultimodalRequest, kvBitsSet: params.kvBits != nil,
             isVLM: isVLM, vlmTextCacheSafe: vlmTextCacheSafe)
@@ -2905,6 +2919,9 @@ func handleChatCompletion(
             : hybridCacheBoundary(
                 promptTokens: promptTokens,
                 imStartId: context.tokenizer.convertTokenToId("<|im_start|>"), cache: cache)
+                ?? snapshotCacheBoundary(
+                    promptTokens: promptTokens,
+                    assistantId: context.tokenizer.convertTokenToId("<｜Assistant｜>"), cache: cache)
         // ── Sliding-window (RotatingKVCache) prompt cache ──
         // Same reasoning as the hybrid path: the late save below runs one decode token after
         // the prompt, when the ring buffer no longer lines up with `promptTokens`. Snapshot

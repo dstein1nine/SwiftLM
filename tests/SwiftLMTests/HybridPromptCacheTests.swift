@@ -163,4 +163,53 @@ final class HybridPromptCacheTests: XCTestCase {
                            "keep=\(keep)")
         }
     }
+
+    // MARK: - Snapshot-only caches (DeepSeek V4.1)
+
+    /// Stands in for DeepseekV41LayerCache: restorable through state/metaState, never trimmable.
+    private final class SnapshotOnlyCache: BaseKVCache, PrefixSnapshotKVCache {
+        var rows: MLXArray?
+        override var state: [MLXArray] {
+            get { [rows ?? MLXArray.zeros([0])] }
+            set { rows = newValue[0].size == 0 ? nil : newValue[0] }
+        }
+        override var metaState: [String] {
+            get { [String(offset)] }
+            set { offset = Int(newValue[0]) ?? 0 }
+        }
+    }
+
+    private let assistant = 9
+
+    func testSnapshotBoundaryIsLastAssistantHeader() {
+        let tokens = [1, assistant, 2, 3, assistant, 4]
+        XCTAssertEqual(snapshotCacheBoundary(promptTokens: tokens, assistantId: assistant,
+                                             cache: [SnapshotOnlyCache(), SnapshotOnlyCache()]), 4)
+        XCTAssertNil(snapshotCacheBoundary(promptTokens: tokens, assistantId: assistant,
+                                           cache: [SnapshotOnlyCache(), KVCacheSimple()]),
+                     "every layer must be snapshot-only")
+        XCTAssertNil(snapshotCacheBoundary(promptTokens: tokens, assistantId: nil,
+                                           cache: [SnapshotOnlyCache()]))
+        XCTAssertNil(snapshotCacheBoundary(promptTokens: [assistant, 1], assistantId: assistant,
+                                           cache: [SnapshotOnlyCache()]),
+                     "no history before the only assistant header")
+    }
+
+    func testSnapshotOnlyCacheRestoresExactPrefixOnly() async {
+        let pc = PromptCache()
+        let live = SnapshotOnlyCache()
+        live.rows = MLXArray.ones([1, 3, 4]) * 5
+        live.offset = 3
+        await pc.save(tokens: [1, 2, 3], cache: [live], allowRecurrent: true)
+
+        let fresh = SnapshotOnlyCache()
+        let n = await pc.restoreExactPrefix(newTokens: [1, 2, 3, 4], limit: 3, into: [fresh])
+        XCTAssertEqual(n, 3)
+        XCTAssertEqual(fresh.offset, 3)
+        XCTAssertEqual(fresh.rows?.sum().item(Float.self), 60)
+
+        let diverged = await pc.restoreExactPrefix(
+            newTokens: [1, 8, 3, 4], limit: 3, into: [SnapshotOnlyCache()])
+        XCTAssertNil(diverged, "a snapshot cannot be rewound to a shorter prefix")
+    }
 }
