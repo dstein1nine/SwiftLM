@@ -901,6 +901,7 @@ struct MLXServer: AsyncParsableCommand {
 
         if self.streamExperts, let modelDir = modelDirectory {
             setenv("EXPERIMENTAL_SSD_STREAM", modelDir.path, 1)
+            StreamTuning.apply(modelDirectory: modelDir)
             // Activate the modern Swift ExpertStreamingConfig so Load.swift can:
             //  1. Initialize ExpertStreamerManager (shard index for getFile())
             //  2. Assign tensorName on every QuantizedSwitchLinear after quantize()
