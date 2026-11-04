@@ -7,7 +7,8 @@
 //     {"env": {"MLX_MOE_CACHE_SLOTS": "16", "MLX_MOE_PREFETCH_TOPK": "6"}, ...}
 //
 // With --stream-experts the server applies that file before loading. A variable already
-// set in the environment wins, so a manual override still works.
+// set in the environment wins, so a manual override still works. An optional
+// "prefill_size" sets the prompt chunk size when --prefill-size isn't given.
 
 import Foundation
 
@@ -31,20 +32,32 @@ enum StreamTuning {
         return directory.appendingPathComponent("\(key).json")
     }
 
+    /// The tuning file's contents, or nil when there is none or it can't be read.
+    private static func load(for modelDirectory: URL, in directory: URL) -> [String: Any]? {
+        let url = file(for: modelDirectory, in: directory)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("[SwiftLM] ⚠️  Ignoring unreadable stream tuning file \(url.path)")
+            return nil
+        }
+        return json
+    }
+
+    /// The tuned prompt chunk size for `modelDirectory`, if the file sets a positive one.
+    static func prefillSize(for modelDirectory: URL, in directory: URL = defaultDirectory) -> Int? {
+        guard let n = load(for: modelDirectory, in: directory)?["prefill_size"] as? Int, n > 0
+        else { return nil }
+        return n
+    }
+
     /// The tuned variables for `modelDirectory` that `environment` doesn't already set.
     /// Empty when there is no tuning file or it can't be read.
     static func settings(
         for modelDirectory: URL, environment: [String: String],
         in directory: URL = defaultDirectory
     ) -> [String: String] {
-        let url = file(for: modelDirectory, in: directory)
-        guard let data = try? Data(contentsOf: url) else { return [:] }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let env = json["env"] as? [String: Any]
-        else {
-            print("[SwiftLM] ⚠️  Ignoring unreadable stream tuning file \(url.path)")
-            return [:]
-        }
+        guard let env = load(for: modelDirectory, in: directory)?["env"] as? [String: Any]
+        else { return [:] }
         var result: [String: String] = [:]
         for (key, value) in env where tunableKeys.contains(key) && environment[key] == nil {
             switch value {

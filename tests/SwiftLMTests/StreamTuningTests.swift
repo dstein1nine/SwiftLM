@@ -38,6 +38,14 @@ final class StreamTuningTests: XCTestCase {
         XCTAssertEqual(settings, ["MLX_MOE_CACHE_SLOTS": "24", "MLX_MOE_PREFETCH_TOPK": "8"])
     }
 
+    func testPrefillSizeIsReadWhenPositive() throws {
+        XCTAssertNil(StreamTuning.prefillSize(for: modelDir, in: tuningDir))
+        try writeTuning(#"{"env": {}, "prefill_size": 16384}"#)
+        XCTAssertEqual(StreamTuning.prefillSize(for: modelDir, in: tuningDir), 16384)
+        try writeTuning(#"{"env": {}, "prefill_size": 0}"#)
+        XCTAssertNil(StreamTuning.prefillSize(for: modelDir, in: tuningDir))
+    }
+
     func testNoFileOrBadFileAppliesNothing() throws {
         XCTAssertEqual(StreamTuning.settings(for: modelDir, environment: [:], in: tuningDir), [:])
         try writeTuning("not json")
