@@ -3012,7 +3012,7 @@ func handleChatCompletion(
             }
             stream = try MLXLMCommon.generate(
                 input: LMInput(text: sliceText(lmInput.text, from: boundary)),
-                cache: cache, parameters: params, context: context, components: genComponents)
+                cache: cache, parameters: params, context: context, components: genComponents, tools: toolSpecs)
         } else if let boundary = rotatingBoundary {
             var start = await promptCache.restore(newTokens: promptTokens, into: cache) ?? 0
             if start >= promptLength {
@@ -3036,7 +3036,7 @@ func handleChatCompletion(
             }
             stream = try MLXLMCommon.generate(
                 input: LMInput(text: sliceText(lmInput.text, from: start)),
-                cache: cache, parameters: params, context: context, components: genComponents)
+                cache: cache, parameters: params, context: context, components: genComponents, tools: toolSpecs)
         } else if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
             // Bypass prompt cache to avoid draft/main KV drift on partial-match restores.
@@ -3044,7 +3044,7 @@ func handleChatCompletion(
             print("[SwiftLM] Draft model type: \(type(of: draftRef.model))")
             stream = try MLXLMCommon.generate(
                 input: lmInput, cache: cache, parameters: params, context: context,
-                draftModel: draftRef.model, numDraftTokens: numDraftTokens
+                draftModel: draftRef.model, numDraftTokens: numDraftTokens, tools: toolSpecs
             )
         } else if !skipPromptCache, let cachedCount = await promptCache.restore(newTokens: promptTokens, into: cache) {
             // Cache hit: KV state is pre-populated up to cachedCount tokens.
@@ -3061,25 +3061,26 @@ func handleChatCompletion(
             let trimmedInput = LMInput(text: sliceText(lmInput.text, from: startIndex))
             if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
-                    input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
+                    input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens, tools: toolSpecs
                 )
             } else {
                 stream = try MLXLMCommon.generate(
                     input: trimmedInput, cache: cache, parameters: params, context: context,
-                    components: genComponents
+                    components: genComponents, tools: toolSpecs
                 )
             }
         } else {
             // Cache miss: process the full prompt.
             if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
-                    input: lmInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
+                    input: lmInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens, tools: toolSpecs
                 )
             } else {
                 let start = try await snapshotPrompt(from: 0)
                 stream = try MLXLMCommon.generate(
                     input: start == 0 ? lmInput : LMInput(text: sliceText(lmInput.text, from: start)),
-                    cache: cache, parameters: params, context: context, components: genComponents
+                    cache: cache, parameters: params, context: context, components: genComponents,
+                    tools: toolSpecs
                 )
             }
         }
