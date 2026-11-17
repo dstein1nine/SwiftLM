@@ -2816,7 +2816,10 @@ func handleChatCompletion(
     if thinkingPreOpened {
         print("[SwiftLM] Chat template pre-opened the thinking block — parsing output as reasoning until the closing tag.")
     }
-    let parseReasoning = enableThinking || thinkingPreOpened
+    // A model that always reasons (MiniMax M3 decides per turn, with no off switch) opens
+    // the block itself even with thinking off.
+    let alwaysReasons = await container.configuration.reasoningConfig?.promptStrategy == .alwaysOn
+    let parseReasoning = enableThinking || thinkingPreOpened || alwaysReasons
 
     // llama-server style: announce prefill start
     print("srv  slot_launch: id 0 | prompt=\(promptTokenCount)t | thinking=\(enableThinking) | prefilling...")
@@ -3169,8 +3172,8 @@ struct ThinkingStateTracker {
 
     /// Opening/closing tag spellings, longest-first so `<thinking>` is preferred
     /// over the `<think>` prefix when both could match.
-    static let openTags = ["<thinking>", "<think>", "<|channel>thought\n", "<|channel>thought"]
-    static let closeTags = ["</thinking>", "</think>", "<channel|>"]
+    static let openTags = ["<thinking>", "<think>", "<mm:think>", "<|channel>thought\n", "<|channel>thought"]
+    static let closeTags = ["</thinking>", "</think>", "</mm:think>", "<channel|>"]
 
     /// - Parameter startInThinking: true when the chat template already emitted an
     ///   unclosed opening tag at the end of the prompt, so the model's first token
@@ -3913,8 +3916,8 @@ func handleChatNonStreaming(
 ///   at the end of the prompt, so `text` starts *inside* the block with no opening tag
 ///   of its own (issue #108). Everything up to the first closing tag is reasoning.
 func extractThinkingBlock(from text: String, alreadyOpen: Bool = false) -> (String?, String) {
-    let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
-    let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "<channel|>")
+    let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<mm:think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
+    let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "</mm:think>") ?? text.range(of: "<channel|>")
 
     // Template pre-opened the block. Only a tag at the very start means the model
     // re-emitted its own opening tag; a tag further in is the model *talking about* one

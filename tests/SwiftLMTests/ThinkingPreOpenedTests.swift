@@ -249,4 +249,35 @@ final class ThinkingPreOpenedTests: XCTestCase {
         XCTAssertNil(thinking)
         XCTAssertEqual(remaining, "straight to the answer")
     }
+
+    // MARK: - MiniMax M3 (`<mm:think>`, opened by the model itself)
+
+    /// The block streams in split pieces, as the tokens arrive.
+    func testStreamingMiniMaxThinkTags() {
+        var tracker = ThinkingStateTracker()
+        var reasoning = "", content = ""
+        for chunk in ["<mm:", "think>The user wants", " two sentences.</mm", ":think>", "Sunlight scatters."] {
+            let (r, c) = tracker.process(chunk)
+            reasoning += r
+            content += c
+        }
+        let (r, c) = tracker.flush()
+        XCTAssertEqual(reasoning + r, "The user wants two sentences.")
+        XCTAssertEqual(content + c, "Sunlight scatters.")
+    }
+
+    /// Adaptive mode: a turn without thinking is all content.
+    func testStreamingMiniMaxWithoutThinking() {
+        var tracker = ThinkingStateTracker()
+        let (r, c) = tracker.process("Direct answer.")
+        XCTAssertEqual(r, "")
+        XCTAssertEqual(c, "Direct answer.")
+    }
+
+    func testExtractMiniMaxThinkBlock() {
+        let (thinking, remaining) = extractThinkingBlock(
+            from: "<mm:think>The user wants a short answer.</mm:think>Blue light scatters most.")
+        XCTAssertEqual(thinking, "The user wants a short answer.")
+        XCTAssertEqual(remaining, "Blue light scatters most.")
+    }
 }
