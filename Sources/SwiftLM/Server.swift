@@ -1958,6 +1958,21 @@ actor ServerStats {
 
 
 
+/// Decode-only timing for `timings.predicted_*` and /metrics. Prefill is left out: on a
+/// streamed MoE model it is often half of a turn, and counting it made decode look 2-3x slower.
+struct DecodeClock {
+    private var firstChunk: Date?
+    private var generateTime: TimeInterval?
+    /// Call on every `.chunk`.
+    mutating func chunk() { if firstChunk == nil { firstChunk = Date() } }
+    /// The generator's own decode time, timed from the first generated token.
+    mutating func info(_ info: GenerateCompletionInfo) { generateTime = info.generateTime }
+    /// The generator's decode time; without `.info` (a stop sequence ended the stream),
+    /// the time since the first chunk.
+    var seconds: TimeInterval { generateTime ?? firstChunk.map { Date().timeIntervalSince($0) } ?? 0 }
+    func tokensPerSecond(_ tokens: Int) -> Double { seconds > 0 ? Double(tokens) / seconds : 0 }
+}
+
 /// Recurrent (MambaCache) layer state captured after `position` prompt tokens, keyed by
 /// layer index. Recurrent state cannot be rewound, so a hybrid prompt that diverges from a
 /// cached one resumes from the last checkpoint before the divergence instead of from zero.
@@ -3399,6 +3414,7 @@ func handleChatStreaming(
         var fullText = ""
         var stopped = false
         var firstToken = true
+        var decodeClock = DecodeClock()
         var tracker = ThinkingStateTracker(startInThinking: enableThinking && thinkingPreOpened)
         // Raw characters handed to the thinking tracker — not necessarily characters on
         // the wire, since the tracker may still be holding a partial tag — plus the tail
@@ -3473,6 +3489,7 @@ func handleChatStreaming(
             switch generation {
             case .chunk(let text, _):
                 completionTokenCount += 1
+                decodeClock.chunk()
                 fullText += text
                 unscannedStopChars += text.count
                 // GPU yield: prevent Metal from starving macOS WindowServer
@@ -3563,8 +3580,8 @@ func handleChatStreaming(
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
                     // Stopping here means `.info` never arrives, so usage is the chunk
                     // count: a slight undercount if the decoder buffered any tokens.
-                    let genDur = Date().timeIntervalSince(genStart)
-                    let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
+                    let genDur = decodeClock.seconds
+                    let genTokPerSec = decodeClock.tokensPerSecond(completionTokenCount)
                     if includeUsage {
                         cont.yield(sseUsageChunk(modelId: modelId, promptTokens: promptTokenCount, completionTokens: completionTokenCount, tokPerSec: genTokPerSec, durationMs: genDur * 1000))
                     }
@@ -3617,6 +3634,7 @@ func handleChatStreaming(
                 // The chunk count undercounts: tokens the decoder buffers (tool-call
                 // bodies, partial text) emit no chunk. `info` carries the real count.
                 completionTokenCount = info.generationTokenCount
+                decodeClock.info(info)
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -3655,8 +3673,8 @@ func handleChatStreaming(
                         }
                     }
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: reason))
-                    let genDur = Date().timeIntervalSince(genStart)
-                    let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
+                    let genDur = decodeClock.seconds
+                    let genTokPerSec = decodeClock.tokensPerSecond(completionTokenCount)
                     if includeUsage {
                         cont.yield(sseUsageChunk(modelId: modelId, promptTokens: promptTokenCount, completionTokens: completionTokenCount, tokPerSec: genTokPerSec, durationMs: genDur * 1000))
                     }
@@ -3666,7 +3684,6 @@ func handleChatStreaming(
                     print("")  // end the real-time token stream line
                     let postMemSnap = MemoryUtils.snapshot()
                     print("srv  slot done: id 0 | gen_tokens=\(completionTokenCount) | OS_RAM=\(String(format: "%.1f", postMemSnap.os))GB | MEM_DEMAND=\(String(format: "%.1f", postMemSnap.demand))GB | GPU_MEM=\(String(format: "%.1f", postMemSnap.gpu))GB")
-                    let dur = genDur
                     let tokPerSec = genTokPerSec
                     let logContent: Any = hasToolCalls ? NSNull() : fullText
                     let logResp: [String: Any] = [
@@ -3710,7 +3727,7 @@ func handleChatStreaming(
             }
         }
         cont.finish()
-        let duration = Date().timeIntervalSince(genStart)
+        let duration = decodeClock.seconds
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
     }
     // If the client disconnects, Hummingbird tears down the response body,
@@ -3747,12 +3764,14 @@ func handleChatNonStreaming(
     var tcIndex = 0
     var generationStopReason: GenerateStopReason = .stop
     var firstToken = true
+    var decodeClock = DecodeClock()
     let stopWindow = stopScanWindow(stopSequences)
     generationLoop: for await generation in stream {
         switch generation {
         case .chunk(let text, _):
             fullText += text
             completionTokenCount += 1
+            decodeClock.chunk()
             // End generation at the first stop sequence, as the streaming path does. The
             // text is trimmed below either way; continuing only spends compute and bills
             // the client for tokens that are discarded. `.info` never arrives on this
@@ -3798,6 +3817,7 @@ func handleChatNonStreaming(
             if let onGenerationDone { await onGenerationDone(info.generatedTokenIds) }
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
+            decodeClock.info(info)
         default:
             // Events this build does not model (mlx-swift-lm's `.reasoning`, from the 2026-10
             // upstream sync) are ignored: SwiftLM still splits `<think>` out of `.chunk` text itself.
@@ -3807,7 +3827,7 @@ func handleChatNonStreaming(
     print("")  // end the real-time token stream line
     let postMemSnap = MemoryUtils.snapshot()
     print("srv  slot done: id 0 | gen_tokens=\(completionTokenCount) | OS_RAM=\(String(format: "%.1f", postMemSnap.os))GB | MEM_DEMAND=\(String(format: "%.1f", postMemSnap.demand))GB | GPU_MEM=\(String(format: "%.1f", postMemSnap.gpu))GB")
-    let duration = Date().timeIntervalSince(genStart)
+    let duration = decodeClock.seconds
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
     slot.release()
 
@@ -4053,6 +4073,7 @@ func handleTextStreaming(
         var fullText = ""
         var stopped = false
         var firstToken = true
+        var decodeClock = DecodeClock()
         // Characters already sent, and the tail withheld because it could still open
         // a stop sequence (#133). Local to this loop; the chat path has its own pair.
         var emittedTextCount = 0
@@ -4088,6 +4109,7 @@ func handleTextStreaming(
                     firstToken = false
                 }
                 completionTokenCount += 1
+                decodeClock.chunk()
                 fullText += text
                 // GPU yield: prevent Metal from starving macOS WindowServer
                 if completionTokenCount % 8 == 0 {
@@ -4128,6 +4150,7 @@ func handleTextStreaming(
                 // The chunk count undercounts: tokens the decoder buffers (tool-call
                 // bodies, partial text) emit no chunk. `info` carries the real count.
                 completionTokenCount = info.generationTokenCount
+                decodeClock.info(info)
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -4161,7 +4184,7 @@ func handleTextStreaming(
             heldStopTail = ""
         }
         cont.finish()
-        let duration = Date().timeIntervalSince(genStart)
+        let duration = decodeClock.seconds
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
     }
     cont.onTermination = { _ in consumerTask.cancel() }
@@ -4186,12 +4209,14 @@ func handleTextNonStreaming(
     var fullText = ""
     var completionTokenCount = 0
     var generationStopReason: GenerateStopReason = .stop
+    var decodeClock = DecodeClock()
     let stopWindow = stopScanWindow(stopSequences)
     generationLoop: for await generation in stream {
         switch generation {
         case .chunk(let text, _):
             fullText += text
             completionTokenCount += 1
+            decodeClock.chunk()
             // See handleChatNonStreaming: stop generating at the first stop sequence.
             if !stopSequences.isEmpty,
                checkStopSequences(fullText, stopSequences: stopSequences, lookback: stopWindow + text.count) != nil
@@ -4205,6 +4230,7 @@ func handleTextNonStreaming(
         case .info(let info):
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
+            decodeClock.info(info)
         case .toolCall, .rejectedToolCall:
             break
         default:
@@ -4213,7 +4239,7 @@ func handleTextNonStreaming(
             break
         }
     }
-    let duration = Date().timeIntervalSince(genStart)
+    let duration = decodeClock.seconds
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
     slot.release()
 
