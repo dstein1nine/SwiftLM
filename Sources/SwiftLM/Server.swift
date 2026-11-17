@@ -2794,14 +2794,14 @@ func handleChatCompletion(
     // the prompt tail detects this without hard-coding any particular template:
     // 32 tokens comfortably covers the trailing `<|im_start|>assistant\n<think>\n`
     // while keeping the decode negligible.
-    var thinkingPreOpened = false
-    if enableThinking {
-        let tail = await container.tokenizer.decode(tokenIds: Array(promptTokens.suffix(32)), skipSpecialTokens: false)
-        thinkingPreOpened = ThinkingStateTracker.opensUnclosedThinkingBlock(tail)
-        if thinkingPreOpened {
-            print("[SwiftLM] Chat template pre-opened the thinking block — parsing output as reasoning until the closing tag.")
-        }
+    // Checked even with thinking off: some templates (GLM-5.3) always open the block, and
+    // their reasoning must still go to reasoning_content rather than the answer.
+    let tail = await container.tokenizer.decode(tokenIds: Array(promptTokens.suffix(32)), skipSpecialTokens: false)
+    let thinkingPreOpened = ThinkingStateTracker.opensUnclosedThinkingBlock(tail)
+    if thinkingPreOpened {
+        print("[SwiftLM] Chat template pre-opened the thinking block — parsing output as reasoning until the closing tag.")
     }
+    let parseReasoning = enableThinking || thinkingPreOpened
 
     // llama-server style: announce prefill start
     print("srv  slot_launch: id 0 | prompt=\(promptTokenCount)t | thinking=\(enableThinking) | prefilling...")
@@ -3117,7 +3117,7 @@ func handleChatCompletion(
         return handleChatStreaming(
             startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-            enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
+            enableThinking: parseReasoning, thinkingPreOpened: thinkingPreOpened,
             jsonMode: jsonMode, tokenEcho: config.tokenEcho, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
             emitPrefillProgress: emitPrefillProgress
@@ -3128,11 +3128,11 @@ func handleChatCompletion(
         // non-streaming response writes nothing until the end. The generation then ran
         // to max_tokens for nobody and held the slot the whole time (and with the
         // default --parallel 1, every later request behind it).
-        return try await cancellingOnClientDisconnect(channel) { [enableThinking, thinkingPreOpened] in
+        return try await cancellingOnClientDisconnect(channel) { [parseReasoning, thinkingPreOpened] in
             let (stream, onGenerationDone) = try await startGeneration()
             return try await handleChatNonStreaming(
                 stream: stream, modelId: modelId, stopSequences: stopSequences,
-                promptTokenCount: promptTokenCount, enableThinking: enableThinking,
+                promptTokenCount: promptTokenCount, enableThinking: parseReasoning,
                 thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
                 slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
                 onGenerationDone: onGenerationDone
@@ -3589,7 +3589,7 @@ func handleChatStreaming(
             case .toolCall(let tc):
                 hasToolCalls = true
                 let argsJson = serializeToolCallArgs(tc.function.arguments)
-                cont.yield(sseToolCallChunk(modelId: modelId, index: toolCallIndex, name: tc.function.name, arguments: argsJson))
+                cont.yield(sseToolCallChunk(modelId: modelId, index: toolCallIndex, id: tc.id, name: tc.function.name, arguments: argsJson))
                 toolCallIndex += 1
 
             case .rejectedToolCall(let rejection):
@@ -3599,6 +3599,10 @@ func handleChatStreaming(
                 // `RejectedToolCall`'s doc comment, never log `rawTextPreview`; it may
                 // contain sensitive argument text.
                 print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
+                // Pass the model's text through as content: a reply whose only output was a
+                // broken call would otherwise be empty, and an empty reply stalls agent clients.
+                cont.yield(sseChunk(modelId: modelId, reasoningContent: nil,
+                                    content: rejectedCallText(rejection), finishReason: nil))
 
             case .info(let info):
                 // `.info` is the producer's last yield, so the cache is no longer written once
@@ -3778,7 +3782,7 @@ func handleChatNonStreaming(
         case .toolCall(let tc):
             let argsJson = serializeToolCallArgs(tc.function.arguments)
             collectedToolCalls.append(ToolCallResponse(
-                id: "call_\(UUID().uuidString.prefix(8))",
+                id: tc.id ?? "call_\(UUID().uuidString.prefix(8))",
                 type: "function",
                 function: ToolCallFunction(name: tc.function.name, arguments: argsJson)
             ))
@@ -3786,6 +3790,7 @@ func handleChatNonStreaming(
         case .rejectedToolCall(let rejection):
             // See the matching comment in `handleChatStreaming`: log only, no wire shape.
             print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
+            fullText += rejectedCallText(rejection)
         case .info(let info):
             // The producer's last yield; see the matching comment in `handleChatStreaming`.
             // The stop-sequence `break` above exits before `.info`; the paths that save at the
@@ -4818,7 +4823,15 @@ func sseUsageChunk(modelId: String, promptTokens: Int, completionTokens: Int, to
     return "data: \(String(data: data, encoding: .utf8)!)\r\n\r\n"
 }
 
-func sseToolCallChunk(modelId: String, index: Int, name: String, arguments: String) -> String {
+/// The model's text for a tool call that failed to parse, sent to the client as content.
+/// Past 32 KB the preview drops the middle of the text.
+func rejectedCallText(_ rejection: RejectedToolCall) -> String {
+    rejection.rawTextPreview
+}
+
+/// `id` is the parser's call id when the model wrote one (Kimi's `functions.name:N`);
+/// templates render it back into the history, so it must keep the model's format.
+func sseToolCallChunk(modelId: String, index: Int, id: String? = nil, name: String, arguments: String) -> String {
     let chunk: [String: Any] = [
         "id": "chatcmpl-\(UUID().uuidString)",
         "object": "chat.completion.chunk",
@@ -4830,7 +4843,7 @@ func sseToolCallChunk(modelId: String, index: Int, name: String, arguments: Stri
                 "role": "assistant",
                 "tool_calls": [[
                     "index": index,
-                    "id": "call_\(UUID().uuidString.prefix(8))",
+                    "id": id ?? "call_\(UUID().uuidString.prefix(8))",
                     "type": "function",
                     "function": [
                         "name": name,
