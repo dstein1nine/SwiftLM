@@ -3170,6 +3170,9 @@ struct ThinkingStateTracker {
     enum Phase { case thinking, responding }
     private(set) var phase: Phase = .responding
     private var buffer = ""  // accumulates chars looking for tag boundaries
+    /// Nothing emitted yet. A closing tag here marks a turn without reasoning
+    /// (MiniMax M3 writes `</mm:think>` alone) and is dropped.
+    private var atStart = true
 
     /// Opening/closing tag spellings, longest-first so `<thinking>` is preferred
     /// over the `<think>` prefix when both could match.
@@ -3222,6 +3225,18 @@ struct ThinkingStateTracker {
         while !buffer.isEmpty {
             switch phase {
             case .responding:
+                if atStart {
+                    let leading = buffer.drop { $0.isWhitespace }
+                    if let tag = Self.closeTags.first(where: { leading.hasPrefix($0) }) {
+                        buffer = String(leading.dropFirst(tag.count))
+                        atStart = false
+                        continue
+                    }
+                    if leading.isEmpty || Self.closeTags.contains(where: { $0.hasPrefix(leading) }) {
+                        return (reasoning, content)
+                    }
+                    atStart = false
+                }
                 let startRange = Self.firstRange(in: buffer, of: Self.openTags)
                 if let range = startRange {
                     // Flush text before the tag as response content
@@ -3917,6 +3932,11 @@ func handleChatNonStreaming(
 ///   at the end of the prompt, so `text` starts *inside* the block with no opening tag
 ///   of its own (issue #108). Everything up to the first closing tag is reasoning.
 func extractThinkingBlock(from text: String, alreadyOpen: Bool = false) -> (String?, String) {
+    // A closing tag first marks a turn without reasoning (MiniMax M3 writes `</mm:think>` alone).
+    let leading = text.drop { $0.isWhitespace }
+    if !alreadyOpen, let tag = ThinkingStateTracker.closeTags.first(where: { leading.hasPrefix($0) }) {
+        return (nil, String(leading.dropFirst(tag.count)).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
     let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<mm:think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
     let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "</mm:think>") ?? text.range(of: "<channel|>")
 

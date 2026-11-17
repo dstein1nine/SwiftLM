@@ -274,6 +274,43 @@ final class ThinkingPreOpenedTests: XCTestCase {
         XCTAssertEqual(c, "Direct answer.")
     }
 
+    /// A turn without reasoning starts with a bare `</mm:think>` (the template's no-thinking form).
+    func testStreamingMiniMaxBareCloseTagIsDropped() {
+        for chunks in [["</mm:think>I'll call it."], ["</", "mm:", "think>", "I'll call it."], ["\n</mm:think>I'll", " call it."]] {
+            var tracker = ThinkingStateTracker()
+            var reasoning = "", content = ""
+            for chunk in chunks {
+                let (r, c) = tracker.process(chunk)
+                reasoning += r
+                content += c
+            }
+            let (r, c) = tracker.flush()
+            XCTAssertEqual(reasoning + r, "", "\(chunks)")
+            XCTAssertEqual(content + c, "I'll call it.", "\(chunks)")
+        }
+    }
+
+    /// Only a leading closing tag is dropped; markup at the start and tags later in the answer stay.
+    func testStreamingAnswerStartingWithMarkupIsKept() {
+        for (chunks, expected) in [
+            (["<", "b>bold</b>"], "<b>bold</b>"),
+            (["Use ", "</mm:think> to end it."], "Use </mm:think> to end it."),
+            (["<"], "<"),
+        ] {
+            var tracker = ThinkingStateTracker()
+            var content = ""
+            for chunk in chunks { content += tracker.process(chunk).content }
+            content += tracker.flush().content
+            XCTAssertEqual(content, expected, "\(chunks)")
+        }
+    }
+
+    func testExtractMiniMaxBareCloseTag() {
+        let (thinking, remaining) = extractThinkingBlock(from: "</mm:think>I'll make both calls now.")
+        XCTAssertNil(thinking)
+        XCTAssertEqual(remaining, "I'll make both calls now.")
+    }
+
     func testExtractMiniMaxThinkBlock() {
         let (thinking, remaining) = extractThinkingBlock(
             from: "<mm:think>The user wants a short answer.</mm:think>Blue light scatters most.")
